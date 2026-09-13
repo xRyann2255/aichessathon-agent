@@ -1,6 +1,12 @@
 # AI Chessathon agent
 
-The chess engine I entered in the [AI Chessathon 2026](https://aichessathon.com), the UK's first chess hackathon, as a one-person team. It finished **2nd of 465 teams in the online qualifier**, held the **highest peak rating of the qualifier**, and placed **5th in the London final** on 12 September 2026. This repository is the final submission uploaded, byte for byte.
+The chess engine I entered in the [AI Chessathon 2026](https://aichessathon.com), the UK's first chess hackathon, as a one-person team.
+
+- **2nd of 465 teams in the online qualifier**
+- **Highest peak rating of the qualifier**
+- **5th in the London final**, 12 September 2026
+
+This repository is the final submission uploaded, byte for byte.
 
 ## The contract it ran under
 
