@@ -37,6 +37,130 @@ The net's accumulators are kept per ply and updated incrementally as the search 
 
 The time manager was designed from the platform's own game logs rather than from local runs, because the platform's core ran about 1.4 times slower than the development machine and rated games were ending with clock unspent. The opening book was built to reach as deep as the zip's room allowed: a mean exit at move 17 on the organisers' published starting positions. A mate score, a tablebase result and a bitbase result are treated as verdicts, never as estimates, so nothing that averages or learns from evaluations is allowed to read one.
 
+## Every idea that shipped
+
+Everything in the build, from the techniques every engine has to the ones that exist because of this competition's rules. Each carries the number it was measured at where one exists: a speed figure is nodes a second on an identical search tree, an Elo figure is a paired match against the build before it at 10 s + 0.1 s unless the platform clock is named, and a figure in a source engine is marked as such. A change was merged on its own measurement or on a stated mechanism, never on a hunch.
+
+### Board and move generation
+
+- Bitboards with magic lookups for the sliders, switched to PEXT indexing at import where the host has BMI2 (x1.04 to x1.06).
+- Pseudo-legal move generation with legality tested after make. The pinned pieces are computed once a node, so an unpinned non-king move skips the king-attack test when not in check (x1.02), in quiescence and ProbCut too (x1.05).
+- Evasion filter at nodes in check: a non-king move that cannot capture the checker or block it is skipped before make (x1.07).
+- Gives-check from per-node check masks, without make and unmake (x1.01 to x1.03).
+- King-attack test behind a ray gate: when the empty-board ray from the square holds no enemy slider, the magic lookup is skipped (x1.02).
+- Incremental tapered material and piece-square sums kept in the state array and updated in make and unmake (x1.03).
+- Zobrist hashing with the en passant square keyed only when a capture is legal, as python-chess does, so the repetition test agrees with the referee.
+
+### Search
+
+- Iterative deepening with the best move of the previous iteration in hand from the first, and an anytime abort mid-iteration that keeps a root move that has already beaten it.
+- Fail-soft alpha-beta with principal variation search (+7 pooled over 1,034 games).
+- Aspiration windows from depth 5, half-window 50 cp, widened on the failed bound (+34).
+- Quiescence over captures and promotions with delta pruning, a draw check before stand-pat, a table probe with the static score cached in the entry (+58), a cap of two non-checking captures once futility applies, and a stalemate test.
+- Null-move pruning confined to zero-window nodes, internal iterative reductions at depth 4 or 5 (+64 for the three together with the check extension).
+- Check extension filtered by static exchange: only a checking move that does not lose material extends (+14).
+- Late move reductions from a log-by-log table with a history term, applied to noisy moves as well, and an exemption for quiet pawn pushes to the seventh rank (+5).
+- Move-count pruning with an exemption for checking captures that mate (four Win at Chess misses came from pruning them).
+- Reverse futility pruning, razoring and futility pruning at shallow depth.
+- ProbCut (switching it off at the platform clock reads -26).
+- Static exchange pruning: a quiet move failing the exchange against -48 x depth is skipped, and a capture failing it against -60 x depth (+16).
+- Mate-distance pruning, and the search keeps its full allocation once a mate against it is found, choosing the longest defence (+28 against a field that misses mates).
+- Improving heuristic: the static score against two plies back chooses the move-count and reduction tables.
+- Reductions driven by the child's cutoff count, and the shallow pruning and internal iterative reductions switched off on the previous iteration's principal variation (+18.5 as a bundle with the three ordering rows marked below).
+- Correction history keyed on the pawn structure (+22 in tcheran) and a second table keyed on which pieces each side attacks, both updated only where no mate, tablebase or bitbase verdict decided the node.
+- Mop-up term against a bare king: the losing king's distance from the centre and from the winning king, with the bishop's corner for bishop and knight (+26).
+- Lazy evaluation: the network is skipped when the piece-square estimate lies 400 cp outside the window.
+- Contempt: a repetition or fifty-move draw scores 30 cp against us in the middlegame and 15 in the endgame when the root says we stand better, the reverse when we stand worse, inside a 20 cp dead zone.
+
+### Move ordering
+
+- The table move first, tried before the noisy list is generated at all; captures and promotions by the victim's worth plus a capture history; captures the exchange loses deferred until after the quiets (+31); one killer slot per ply with reset hygiene; a butterfly history with the gravity update (+241 for the first version of this stage).
+- One-level continuation history keyed by the move that led to the node (+15); a pawn-structure history (bundle); the history malus scaled by move count, so a late move is blamed less than an early one (bundle); the main history scaled down at each new root (bundle).
+- A staged picker, so the quiet moves are generated only when nothing before them cut the node, and a branch-free selection scan that compiles to conditional moves.
+
+### Transposition table
+
+- 2^23 entries of one 64-bit word each: an 18-bit tag, the move, depth, bound, generation and score packed together, so a 64-byte cache line holds eight entries (+24.6 at the platform clock for the size, x1.03 for the packing). np.zeros maps the pages lazily, so the 67 MB costs nothing at import.
+- Replacement by age and depth, with the generation weight tuned on a table filled by playing a whole game's moves through one process.
+- A cutoff from an entry is refused when its stored move cannot be played in the position, so a tag collision cannot hand the node a wrong score.
+- The raw network score and the threat key are cached in the word, so a revisited position does not run the head (x1.12).
+- The child's slot is prefetched the moment a move is made, so the line arrives while the accumulator updates (x1.05); the packed move is decoded only after the cutoff test.
+
+### The network at inference
+
+- HalfKA features with the king planes merged and 4 king buckets, a 256-wide int16 accumulator per side, a pairwise product, two 32-wide layers and one output; every number an integer and every rescale a shift.
+- The four-bucket transformer is 2,816 rows against 11,264 for sixteen, so the rows a move gathers stay near the core's L2 (+17 over the sixteen-bucket net).
+- Accumulators kept per ply and never undone: a move writes the child's pair once as the parent's pair less and plus the rows that changed, a king move that keeps its bucket and mirror is updated like any piece, and a refresh starts from the accumulator last built for that king square (x1.03).
+- Accumulators exported to fit int16, with the bound checked over the corpus at export (x1.11).
+- The head's first layer in 8-bit lanes through the packed unsigned-by-signed multiply-add, written as a direct call to the LLVM intrinsic because numba never emits it, AVX-512 VNNI where the host reports it and AVX2 otherwise, chosen at import from the host's feature flags (x1.275 over the plain loop). The second layer runs through the same byte dot, the clip and output loops through the same door (x1.21), and the two scalar clamps are folded into the output loop (x1.07).
+- The accumulator and the first-layer rows aligned to 64 bytes, and forceinline in place of numba's IR-level inlining (x1.06 together).
+- A check file of 100 positions with the net's expected integer outputs, verified at import; a net without one refuses to load, and every tensor's exact shape is checked before anything is read.
+
+### Training the network
+
+- Static regression to engine-annotated scores rather than search in the loop, with a quiet-position filter, the target scaled to 250 and blended with the game result.
+- The shipped net is the previous shipped net warm-started with its transformer unfrozen and fine-tuned on 51.5 million self-play positions from 390,800 games the engine played against itself from the competition's starts, each labelled by its own search at 10,000 nodes a move, with lambda falling from 1.0 to 0.75 across training so the net fits the labeller early and the result late (+19.7 over the net before it).
+- The first 28 plies of every self-play game are dropped, since the book answers them, and the piece-count distribution is flattened by stochastic skipping.
+- A net is handed over only when it is no worse than the shipped net on three held-out instruments (leaf error, tablebase agreement, conversions from our own games), with the floor for each set by three extra seeds of the same recipe; the held-out sets are intersected with every training corpus, by position, before a number from them is believed.
+- Export gates: the integer contract proved on positions taken at a stride across the whole validation set, the quantiser refusing a non-finite weight, the accumulator bound proved against int16, and a mirror-symmetry test in which a position and its colour flip must score as negatives.
+
+### Opening book
+
+- Every game page on the platform is public and carries its starting FEN, so a survey read them all and collected the 308 curated starts with every reply the field played from them. The book covers those, and stops at move 20 as the rules require.
+- Moves from public engine analysis, near-ties rescored by our own engine at 200,000 nodes so the book never walks into a line our evaluation dislikes (3,095 choices changed at the first such cut), a stable choice among tied moves across rebuilds, and every position the harvest paid for shipped.
+- Ten-byte entries, the polyglot key and move word without the weight and learn fields the lookup never reads, read by our own bisect: 8.35 MB for what polyglot stores in 13.4 MB.
+- A book move that repeats a position is refused, so the book cannot shuffle into a threefold draw, and a book reply is played at once with the clock it saves left for later moves.
+- A cut is judged by the mean exit move on the known starts (17.5 at the shipped cut) and merged on a centipawn check of the entries it changes, never on Elo.
+
+### Endgames
+
+- Every 3-man and 4-man Syzygy table, WDL and DTZ, with DTZ probed at the root against the halfmove clock, because a 600-ply draw with no adjudication turns a cursed win into a draw.
+- Root moves ranked by the distance counted from the move itself (a zeroing move at 1, a non-zeroing move at the DTZ after it plus 1), ties handed to the search, which reads the game history.
+- A 5-man subset chosen first by where engines misplay per byte, then re-ranked from a hit counter printed in every game log (7,893 of 10,263 five-man roots answered), with pawnless WDL tables added and four-versus-one DTZ dropped in a byte budget pass before the final build.
+- A 24 KB king-and-pawn bitbase generated by retrograde analysis in numba and checked against Syzygy on all 165,676 legal positions, probed at every such leaf.
+- Tablebase and bitbase results, like mate scores, are verdicts: nothing that averages, interpolates or caches evaluations may read one.
+
+### Time management
+
+- A pooled allocator: the reserve subtracted first, soft and hard bounds (hard at 4x, absolute at 60 percent of the clock), a move horizon that shrinks with the material on the board and never falls under 10 moves once the game passes move 80 (+23 at the platform clock), and a floor of 5 s of clock below which only the increment is spent (+115 for the first manager over none).
+- Node-fraction scaling, best-move stability scaling, eval-stability scaling and a falling-score extension, their product clamped to the hard limit.
+- An iteration-skip guard from the kernel's measured growth per ply, reading the live ratio of the last two iterations (+14).
+- The clock polled every 64 nodes through a ctypes call inside the kernel, with the abort a sticky flag; an unconditional poll is hoisted out of the loop and the search cannot stop.
+- The move count taken from our own counter since the first FEN, never the FEN's fullmove field, since a curated start at move 15 is move one of the game.
+- get_move is never told the increment, so it is inferred from consecutive clock readings, and one scale knob moves the reserve, floor and budgets together for a changed clock on the day of the final.
+- A forced root move (one legal move, or one tablebase-permitted move) returned after a token search rather than a full one.
+- A depth-collapse guard: the soft budget never falls below one increment-sized slice (the class of Stockfish 18's issue 6639).
+
+### Playing the platform's rules
+
+- Repetition and fifty-move counts tracked from the first FEN received, with the opponent's move recovered by diffing consecutive FENs; the referee tests claimability, so the search scores the position one ply before the third occurrence as the draw, and a fifty-move claim at halfmove 99 counts only when the non-zeroing move leaves a legal reply.
+- Every move checked against python-chess's legal move list before it is returned, behind a bounded fallback ladder.
+- The platform keeps the first and last 4 KB of stdout beside each game, so the bot prints one init line (CPU, ISA, cgroup limits, three fixed benchmarks, the net's self-checks, the book and table counts) and a 60-byte line per move (depth, score, time, clock left, the last three iterations, the scaler product, flags), and a line every eight moves with the opponent's clock estimate.
+- The opponent's clock reconstructed from the monotonic gap between our return and the next call, since the process is suspended while the opponent thinks and the clock keeps running; calibrated against the PGN clocks to about a second.
+- The platform's core measured at 1.38 times slower than the development machine from those lines, and the local match clock set from the ratio.
+- No read outside the agent directory and /tmp, no subprocess, no socket, no file written.
+
+### numba engineering
+
+- Everything between the FEN and the move compiled at import: every function warmed with the real argument types, the signatures counted, and a miss raised.
+- Every array a kernel reads arrives as an argument, because numba freezes a global array under a million bytes into the compiled code at first call, silently, so a kernel reading a global never sees a later write.
+- The search's arrays behind one struct handle, so a call moves two words instead of seven per array (x1.09), held as unowned views with no reference counting (x1.41), with numba's runtime off for every kernel (x1.17 to x1.20).
+- Unsigned indices at every bracket, so numba drops the negative-index wraparound it compiles into every signed index (x1.05, twice).
+- noalias on the kernels' pointer arguments, a flag numba carries but never exposes as a jit option.
+- The cold blocks of negamax moved into leaf functions and the ordering into a staged picker, so the recursive function stays short to type.
+- The recursive return type answered from the locked type through a wrapper over numba's type inferer, so negamax's 24 recursive call sites stop re-running inference: cold import from 29.6 s to 20.6 s, and the platform's first-move join from 23 s to 6.5 s.
+- Python entry wrappers left off the 74 kernels nothing calls from Python.
+- The warm-up runs on a thread and the import returns at 25 s whatever remains, so the runner's ready line is always inside the budget and the first move joins the rest.
+- One BLAS thread set before numpy loads: the platform's one core is a cgroup quota over four visible CPUs, and OpenBLAS's spinning workers were spending it on threads the search never used.
+- The host's ISA read at import to choose the AVX-512, AVX2 or plain form of every SIMD kernel, each form checked against a plain loop before the first game.
+
+### Measurement
+
+- Every change measured by paired colour-swapped games with a pentanomial sequential test on 0 to 20 Elo; over 125,000 games in the ledger.
+- Speed changes measured on an identical tree (the same nodes at depth 7 over 201 positions, and to depth 18 on a suite) by interleaved run pairs against an A/A floor read beside them, pinned to one core.
+- A number is not a finding until its floor is known: extra seeds for a net, an A/A run for a match, repeated runs for a benchmark.
+- Every rated game that was not a win got a post-mortem from its log and PGN, a cause, and a fix row.
+
 ## Running it
 
 ```
